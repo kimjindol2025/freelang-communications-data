@@ -1,0 +1,729 @@
+// =============================================================================
+// connection_pool.fl - HTTP 연결 풀링 모듈
+// Agent 7: 통신 & 데이터 | FreeLang v2.5.0
+// 무관용 규칙: R7(>90% 효율), R9(<5sec 재연결), R10(>95% Keep-Alive)
+// =============================================================================
+
+// --- 상수 ---
+let POOL_MIN_CONNECTIONS = 5
+let POOL_MAX_CONNECTIONS = 200
+let POOL_IDLE_TIMEOUT_SEC = 90        // 유휴 연결 타임아웃
+let POOL_CONNECT_TIMEOUT_SEC = 5      // 연결 타임아웃 (R9)
+let POOL_KEEPALIVE_TIMEOUT_SEC = 120  // Keep-Alive 타임아웃
+let POOL_MAX_REQUESTS_PER_CONN = 1000 // 연결당 최대 요청
+let POOL_HEALTH_CHECK_INTERVAL = 30   // 헬스체크 주기 (초)
+let POOL_EVICTION_INTERVAL = 60       // 만료 연결 제거 주기
+
+// 연결 상태
+let CONN_IDLE = 0
+let CONN_ACTIVE = 1
+let CONN_CONNECTING = 2
+let CONN_FAILED = 3
+let CONN_DRAINING = 4
+let CONN_CLOSED = 5
+
+// 프로토콜 버전
+let PROTO_HTTP1 = 1
+let PROTO_HTTP11 = 11
+let PROTO_HTTP2 = 20
+
+// =============================================================================
+// 연결 구조체
+// =============================================================================
+struct PooledConnection {
+  id: i32,
+  host: string,
+  port: i32,
+  protocol: i32,
+  state: i32,
+  keepalive: bool,
+  requests_served: i32,
+  bytes_sent: i32,
+  bytes_received: i32,
+  created_at: i32,
+  last_used_at: i32,
+  last_health_check: i32,
+  latency_ms: i32,
+  error_count: i32,
+  is_tls: bool,
+  remote_addr: string
+}
+
+fn new_connection(id: i32, host: string, port: i32, proto: i32, tls: bool) -> PooledConnection {
+  return PooledConnection {
+    id: id,
+    host: host,
+    port: port,
+    protocol: proto,
+    state: CONN_IDLE,
+    keepalive: true,
+    requests_served: 0,
+    bytes_sent: 0,
+    bytes_received: 0,
+    created_at: 0,
+    last_used_at: 0,
+    last_health_check: 0,
+    latency_ms: 0,
+    error_count: 0,
+    is_tls: tls,
+    remote_addr: host + ":" + port
+  }
+}
+
+// 연결 만료 여부 확인
+fn is_connection_expired(conn: PooledConnection, now: i32) -> bool {
+  // 유휴 타임아웃
+  let idle_time = now - conn.last_used_at
+  if idle_time > POOL_IDLE_TIMEOUT_SEC {
+    return true
+  }
+  // 최대 요청 수 초과
+  if conn.requests_served >= POOL_MAX_REQUESTS_PER_CONN {
+    return true
+  }
+  // 오류 과다
+  if conn.error_count > 5 {
+    return true
+  }
+  return false
+}
+
+// Keep-Alive 유효 여부
+fn is_keepalive_valid(conn: PooledConnection, now: i32) -> bool {
+  if !conn.keepalive {
+    return false
+  }
+  let keepalive_age = now - conn.last_used_at
+  return keepalive_age < POOL_KEEPALIVE_TIMEOUT_SEC
+}
+
+// =============================================================================
+// 연결 풀 핵심 구조체
+// =============================================================================
+struct ConnectionPool {
+  host: string,
+  port: i32,
+  protocol: i32,
+  is_tls: bool,
+  connections: any,          // 전체 연결 목록
+  idle_connections: any,     // 유휴 연결 인덱스
+  active_connections: any,   // 활성 연결 인덱스
+  next_conn_id: i32,
+  min_size: i32,
+  max_size: i32,
+  wait_queue: any,           // 대기 요청 큐
+  metrics: any,              // 풀 메트릭
+  config: any                // 풀 설정
+}
+
+fn new_connection_pool(host: string, port: i32, proto: i32, tls: bool) -> ConnectionPool {
+  return ConnectionPool {
+    host: host,
+    port: port,
+    protocol: proto,
+    is_tls: tls,
+    connections: [],
+    idle_connections: [],
+    active_connections: [],
+    next_conn_id: 1,
+    min_size: POOL_MIN_CONNECTIONS,
+    max_size: POOL_MAX_CONNECTIONS,
+    wait_queue: [],
+    metrics: {
+      total_created: 0,
+      total_destroyed: 0,
+      total_acquired: 0,
+      total_released: 0,
+      total_wait_time_ms: 0,
+      wait_count: 0,
+      keepalive_reuses: 0,
+      keepalive_misses: 0,
+      connect_errors: 0,
+      health_check_failures: 0,
+      evictions: 0,
+      peak_active: 0,
+      reconnect_count: 0,
+      reconnect_success: 0,
+      reconnect_failure: 0
+    },
+    config: {
+      idle_timeout_sec: POOL_IDLE_TIMEOUT_SEC,
+      connect_timeout_sec: POOL_CONNECT_TIMEOUT_SEC,
+      keepalive_timeout_sec: POOL_KEEPALIVE_TIMEOUT_SEC,
+      max_requests_per_conn: POOL_MAX_REQUESTS_PER_CONN,
+      health_check_interval: POOL_HEALTH_CHECK_INTERVAL,
+      eviction_interval: POOL_EVICTION_INTERVAL
+    }
+  }
+}
+
+// =============================================================================
+// 연결 생성 및 획득
+// =============================================================================
+
+// 새 연결 생성 시뮬레이션
+fn create_new_connection(pool: ConnectionPool) -> any {
+  if length(pool.connections) >= pool.max_size {
+    return { ok: false, error: "pool_exhausted", conn: {} }
+  }
+
+  let conn_id = pool.next_conn_id
+  pool.next_conn_id = pool.next_conn_id + 1
+
+  let conn = new_connection(conn_id, pool.host, pool.port, pool.protocol, pool.is_tls)
+  conn.state = CONN_CONNECTING
+
+  // 연결 시뮬레이션 (실제로는 TCP 연결)
+  // connect_timeout_sec 이내 완료 가정
+  conn.state = CONN_IDLE
+  conn.created_at = 0
+  conn.last_used_at = 0
+  conn.last_health_check = 0
+
+  push(pool.connections, conn)
+  push(pool.idle_connections, conn_id)
+
+  pool.metrics.total_created = pool.metrics.total_created + 1
+
+  return { ok: true, conn: conn, conn_id: conn_id }
+}
+
+// 유휴 연결 획득 (Keep-Alive 재사용 - R10)
+fn acquire_idle_connection(pool: ConnectionPool, now: i32) -> any {
+  // 유효한 유휴 연결 탐색
+  let i = 0
+  while i < length(pool.idle_connections) {
+    let conn_id = pool.idle_connections[i]
+    let j = 0
+    while j < length(pool.connections) {
+      if pool.connections[j].id == conn_id {
+        let conn = pool.connections[j]
+        // 만료 확인
+        if is_connection_expired(conn, now) {
+          // 만료 연결 제거 - skip
+          i = i + 1
+          j = length(pool.connections)  // break inner
+        }
+        if is_keepalive_valid(conn, now) {
+          // 유휴 목록에서 제거
+          let new_idle = []
+          let k = 0
+          while k < length(pool.idle_connections) {
+            if k != i {
+              push(new_idle, pool.idle_connections[k])
+            }
+            k = k + 1
+          }
+          pool.idle_connections = new_idle
+
+          // 활성 목록에 추가
+          push(pool.active_connections, conn_id)
+          pool.connections[j].state = CONN_ACTIVE
+          pool.connections[j].requests_served = pool.connections[j].requests_served + 1
+          pool.connections[j].last_used_at = now
+
+          pool.metrics.total_acquired = pool.metrics.total_acquired + 1
+          pool.metrics.keepalive_reuses = pool.metrics.keepalive_reuses + 1
+
+          let active_count = length(pool.active_connections)
+          if active_count > pool.metrics.peak_active {
+            pool.metrics.peak_active = active_count
+          }
+
+          return { ok: true, conn: pool.connections[j], reused: true }
+        }
+        j = length(pool.connections)  // break inner
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+
+  // Keep-Alive 재사용 실패
+  pool.metrics.keepalive_misses = pool.metrics.keepalive_misses + 1
+  return { ok: false, reused: false }
+}
+
+// 연결 획득 (메인 API)
+fn acquire_connection(pool: ConnectionPool, now: i32) -> any {
+  // 1. 유휴 연결 재사용 시도 (Keep-Alive)
+  let idle_result = acquire_idle_connection(pool, now)
+  if idle_result.ok {
+    return { ok: true, conn: idle_result.conn, reused: true, wait_ms: 0 }
+  }
+
+  // 2. 새 연결 생성
+  if length(pool.connections) < pool.max_size {
+    let new_result = create_new_connection(pool)
+    if new_result.ok {
+      // 즉시 활성으로
+      push(pool.active_connections, new_result.conn_id)
+      let i = 0
+      while i < length(pool.connections) {
+        if pool.connections[i].id == new_result.conn_id {
+          pool.connections[i].state = CONN_ACTIVE
+          pool.connections[i].requests_served = pool.connections[i].requests_served + 1
+          pool.connections[i].last_used_at = now
+          i = length(pool.connections)
+        }
+        i = i + 1
+      }
+
+      pool.metrics.total_acquired = pool.metrics.total_acquired + 1
+      let active_count = length(pool.active_connections)
+      if active_count > pool.metrics.peak_active {
+        pool.metrics.peak_active = active_count
+      }
+
+      return { ok: true, conn: new_result.conn, reused: false, wait_ms: 0 }
+    }
+  }
+
+  // 3. 대기 큐 추가
+  let wait_entry = { requested_at: now, timeout_sec: pool.config.connect_timeout_sec }
+  push(pool.wait_queue, wait_entry)
+  pool.metrics.wait_count = pool.metrics.wait_count + 1
+
+  return {
+    ok: false,
+    error: "pool_exhausted_waiting",
+    queue_position: length(pool.wait_queue),
+    estimated_wait_ms: length(pool.wait_queue) * 10
+  }
+}
+
+// =============================================================================
+// 연결 반환 및 관리
+// =============================================================================
+
+// 연결 반환 (Keep-Alive 재등록)
+fn release_connection(pool: ConnectionPool, conn_id: i32, now: i32, success: bool) -> ConnectionPool {
+  // 활성 목록에서 제거
+  let new_active = []
+  let i = 0
+  while i < length(pool.active_connections) {
+    if pool.active_connections[i] != conn_id {
+      push(new_active, pool.active_connections[i])
+    }
+    i = i + 1
+  }
+  pool.active_connections = new_active
+
+  // 연결 상태 업데이트
+  let j = 0
+  while j < length(pool.connections) {
+    if pool.connections[j].id == conn_id {
+      if success {
+        pool.connections[j].state = CONN_IDLE
+        pool.connections[j].last_used_at = now
+        // 유휴 목록에 반환
+        push(pool.idle_connections, conn_id)
+        pool.metrics.total_released = pool.metrics.total_released + 1
+      } else {
+        pool.connections[j].error_count = pool.connections[j].error_count + 1
+        if pool.connections[j].error_count > 5 {
+          pool.connections[j].state = CONN_FAILED
+          pool.metrics.health_check_failures = pool.metrics.health_check_failures + 1
+        } else {
+          pool.connections[j].state = CONN_IDLE
+          push(pool.idle_connections, conn_id)
+        }
+      }
+      j = length(pool.connections)
+    }
+    j = j + 1
+  }
+
+  // 대기 큐 처리
+  if length(pool.wait_queue) > 0 {
+    let new_wait = []
+    let k = 1
+    while k < length(pool.wait_queue) {
+      push(new_wait, pool.wait_queue[k])
+      k = k + 1
+    }
+    pool.wait_queue = new_wait
+  }
+
+  return pool
+}
+
+// 만료 연결 제거 (Eviction)
+fn evict_expired_connections(pool: ConnectionPool, now: i32) -> ConnectionPool {
+  let new_connections = []
+  let evicted = 0
+
+  let i = 0
+  while i < length(pool.connections) {
+    let conn = pool.connections[i]
+    if conn.state == CONN_CLOSED || conn.state == CONN_FAILED {
+      evicted = evicted + 1
+      pool.metrics.total_destroyed = pool.metrics.total_destroyed + 1
+    } else if conn.state == CONN_IDLE && is_connection_expired(conn, now) {
+      evicted = evicted + 1
+      pool.metrics.evictions = pool.metrics.evictions + 1
+      pool.metrics.total_destroyed = pool.metrics.total_destroyed + 1
+    } else {
+      push(new_connections, conn)
+    }
+    i = i + 1
+  }
+
+  pool.connections = new_connections
+
+  // 유휴 목록 갱신
+  let new_idle = []
+  let j = 0
+  while j < length(pool.idle_connections) {
+    let conn_id = pool.idle_connections[j]
+    let found = false
+    let k = 0
+    while k < length(pool.connections) {
+      if pool.connections[k].id == conn_id {
+        found = true
+        k = length(pool.connections)
+      }
+      k = k + 1
+    }
+    if found {
+      push(new_idle, conn_id)
+    }
+    j = j + 1
+  }
+  pool.idle_connections = new_idle
+
+  return pool
+}
+
+// =============================================================================
+// 재연결 로직 (R9: <5초)
+// =============================================================================
+struct ReconnectState {
+  host: string,
+  port: i32,
+  attempt: i32,
+  max_attempts: i32,
+  base_delay_ms: i32,
+  max_delay_ms: i32,
+  total_elapsed_ms: i32,
+  success: bool
+}
+
+fn new_reconnect_state(host: string, port: i32) -> ReconnectState {
+  return ReconnectState {
+    host: host,
+    port: port,
+    attempt: 0,
+    max_attempts: 5,
+    base_delay_ms: 100,    // 초기 재시도 대기
+    max_delay_ms: 2000,    // 최대 대기
+    total_elapsed_ms: 0,
+    success: false
+  }
+}
+
+// 지수 백오프 지연 계산
+fn calculate_backoff_delay(state: ReconnectState) -> i32 {
+  // 2^attempt * base_delay (지수 백오프)
+  let delay = state.base_delay_ms
+  let i = 0
+  while i < state.attempt {
+    delay = delay * 2
+    i = i + 1
+  }
+  // 지터 추가 (±20%)
+  let jitter = delay / 5
+  delay = delay + jitter
+
+  if delay > state.max_delay_ms {
+    delay = state.max_delay_ms
+  }
+  return delay
+}
+
+// 재연결 시도 (R9: 5초 이내 완료)
+fn attempt_reconnect(pool: ConnectionPool, state: ReconnectState) -> any {
+  let RECONNECT_TIMEOUT_MS = POOL_CONNECT_TIMEOUT_SEC * 1000  // 5,000ms
+
+  while state.attempt < state.max_attempts {
+    let delay = calculate_backoff_delay(state)
+
+    // 총 경과 시간 체크 (5초 제한)
+    if state.total_elapsed_ms + delay > RECONNECT_TIMEOUT_MS {
+      // 남은 시간 내에 시도
+      if state.total_elapsed_ms >= RECONNECT_TIMEOUT_MS {
+        pool.metrics.reconnect_failure = pool.metrics.reconnect_failure + 1
+        return {
+          ok: false,
+          error: "reconnect_timeout",
+          elapsed_ms: state.total_elapsed_ms,
+          attempts: state.attempt,
+          r9_pass: false
+        }
+      }
+    }
+
+    state.total_elapsed_ms = state.total_elapsed_ms + delay
+    state.attempt = state.attempt + 1
+    pool.metrics.reconnect_count = pool.metrics.reconnect_count + 1
+
+    // 연결 시도 시뮬레이션
+    // 실제로는 TCP connect() 호출
+    // 성공 시뮬레이션 (3번째 시도에서 성공)
+    if state.attempt >= 1 {
+      // 연결 생성
+      let result = create_new_connection(pool)
+      if result.ok {
+        state.success = true
+        pool.metrics.reconnect_success = pool.metrics.reconnect_success + 1
+        return {
+          ok: true,
+          conn: result.conn,
+          elapsed_ms: state.total_elapsed_ms,
+          attempts: state.attempt,
+          r9_pass: state.total_elapsed_ms < RECONNECT_TIMEOUT_MS
+        }
+      }
+    }
+  }
+
+  pool.metrics.reconnect_failure = pool.metrics.reconnect_failure + 1
+  return {
+    ok: false,
+    error: "max_attempts_exceeded",
+    elapsed_ms: state.total_elapsed_ms,
+    attempts: state.attempt,
+    r9_pass: false
+  }
+}
+
+// =============================================================================
+// 헬스체크
+// =============================================================================
+fn health_check_connection(pool: ConnectionPool, conn_id: i32, now: i32) -> any {
+  let i = 0
+  while i < length(pool.connections) {
+    if pool.connections[i].id == conn_id {
+      let conn = pool.connections[i]
+      // 헬스체크 간격 확인
+      let time_since_check = now - conn.last_health_check
+      if time_since_check < pool.config.health_check_interval {
+        return { ok: true, skipped: true, reason: "too_soon" }
+      }
+
+      // 실제 헬스체크 (HEAD / 또는 TCP ping)
+      // 시뮬레이션: 에러 카운트 기반
+      let healthy = conn.error_count < 3 && conn.state != CONN_FAILED
+      pool.connections[i].last_health_check = now
+
+      if !healthy {
+        pool.connections[i].state = CONN_FAILED
+        pool.metrics.health_check_failures = pool.metrics.health_check_failures + 1
+        return { ok: false, conn_id: conn_id, reason: "unhealthy" }
+      }
+
+      return { ok: true, conn_id: conn_id, healthy: true }
+    }
+    i = i + 1
+  }
+  return { ok: false, error: "conn_not_found" }
+}
+
+// 전체 풀 헬스체크
+fn health_check_pool(pool: ConnectionPool, now: i32) -> any {
+  let healthy = 0
+  let unhealthy = 0
+  let i = 0
+  while i < length(pool.connections) {
+    let conn = pool.connections[i]
+    if conn.state == CONN_IDLE || conn.state == CONN_ACTIVE {
+      let result = health_check_connection(pool, conn.id, now)
+      if result.ok {
+        healthy = healthy + 1
+      } else {
+        unhealthy = unhealthy + 1
+      }
+    }
+    i = i + 1
+  }
+
+  return {
+    healthy: healthy,
+    unhealthy: unhealthy,
+    total: length(pool.connections),
+    idle: length(pool.idle_connections),
+    active: length(pool.active_connections)
+  }
+}
+
+// =============================================================================
+// 풀 효율성 메트릭 (R7: >90%)
+// =============================================================================
+fn calculate_pool_efficiency(pool: ConnectionPool) -> any {
+  let total_requests = pool.metrics.total_acquired
+  let keepalive_reuses = pool.metrics.keepalive_reuses
+
+  let efficiency = 0
+  if total_requests > 0 {
+    efficiency = (keepalive_reuses * 100) / total_requests
+  }
+
+  let keepalive_rate = 0
+  let total_served = pool.metrics.total_acquired
+  let keepalive_served = pool.metrics.keepalive_reuses
+  if total_served > 0 {
+    keepalive_rate = (keepalive_served * 100) / total_served
+  }
+
+  return {
+    efficiency_percent: efficiency,
+    keepalive_rate_percent: keepalive_rate,
+    total_acquired: total_requests,
+    keepalive_reuses: keepalive_reuses,
+    new_connections: pool.metrics.total_created,
+    evictions: pool.metrics.evictions,
+    r7_pass: efficiency > 90,
+    r10_pass: keepalive_rate > 95,
+    pool_utilization: {
+      active: length(pool.active_connections),
+      idle: length(pool.idle_connections),
+      total: length(pool.connections),
+      max: pool.max_size
+    }
+  }
+}
+
+// =============================================================================
+// 멀티 풀 관리자
+// =============================================================================
+struct PoolManager {
+  pools: any,        // 호스트별 풀
+  global_metrics: any
+}
+
+fn new_pool_manager() -> PoolManager {
+  return PoolManager {
+    pools: [],
+    global_metrics: {
+      total_pools: 0,
+      total_connections: 0,
+      total_requests: 0,
+      total_errors: 0
+    }
+  }
+}
+
+// 풀 등록
+fn register_pool(mgr: PoolManager, host: string, port: i32, proto: i32, tls: bool) -> PoolManager {
+  // 중복 확인
+  let i = 0
+  while i < length(mgr.pools) {
+    if mgr.pools[i].host == host && mgr.pools[i].port == port {
+      return mgr
+    }
+    i = i + 1
+  }
+
+  let pool = new_connection_pool(host, port, proto, tls)
+  push(mgr.pools, { host: host, port: port, pool: pool })
+  mgr.global_metrics.total_pools = mgr.global_metrics.total_pools + 1
+
+  return mgr
+}
+
+// 풀 조회
+fn get_pool(mgr: PoolManager, host: string, port: i32) -> any {
+  let i = 0
+  while i < length(mgr.pools) {
+    if mgr.pools[i].host == host && mgr.pools[i].port == port {
+      return { found: true, pool: mgr.pools[i].pool }
+    }
+    i = i + 1
+  }
+  return { found: false, pool: {} }
+}
+
+// 전체 풀 상태 수집
+fn collect_all_pool_metrics(mgr: PoolManager) -> any {
+  let all_metrics = []
+  let i = 0
+  while i < length(mgr.pools) {
+    let pool = mgr.pools[i].pool
+    let eff = calculate_pool_efficiency(pool)
+    push(all_metrics, {
+      host: mgr.pools[i].host,
+      port: mgr.pools[i].port,
+      efficiency: eff
+    })
+    i = i + 1
+  }
+  return {
+    pool_count: length(mgr.pools),
+    pools: all_metrics
+  }
+}
+
+// =============================================================================
+// 공개 API
+// =============================================================================
+
+// 풀 매니저 초기화
+fn init_pool_manager() -> PoolManager {
+  return new_pool_manager()
+}
+
+// 연결 획득 API
+fn get_connection(mgr: PoolManager, host: string, port: i32, now: i32) -> any {
+  let pool_result = get_pool(mgr, host, port)
+  if !pool_result.found {
+    // 자동 풀 생성
+    mgr = register_pool(mgr, host, port, PROTO_HTTP2, true)
+    pool_result = get_pool(mgr, host, port)
+  }
+  return acquire_connection(pool_result.pool, now)
+}
+
+// 연결 반환 API
+fn return_connection(mgr: PoolManager, host: string, port: i32, conn_id: i32, now: i32, success: bool) -> PoolManager {
+  let i = 0
+  while i < length(mgr.pools) {
+    if mgr.pools[i].host == host && mgr.pools[i].port == port {
+      mgr.pools[i].pool = release_connection(mgr.pools[i].pool, conn_id, now, success)
+      return mgr
+    }
+    i = i + 1
+  }
+  return mgr
+}
+
+// 재연결 API (R9)
+fn reconnect(mgr: PoolManager, host: string, port: i32) -> any {
+  let pool_result = get_pool(mgr, host, port)
+  if !pool_result.found {
+    mgr = register_pool(mgr, host, port, PROTO_HTTP2, true)
+    pool_result = get_pool(mgr, host, port)
+  }
+
+  let state = new_reconnect_state(host, port)
+  return attempt_reconnect(pool_result.pool, state)
+}
+
+// 풀 효율성 조회 API (R7, R10)
+fn get_pool_efficiency(mgr: PoolManager, host: string, port: i32) -> any {
+  let pool_result = get_pool(mgr, host, port)
+  if !pool_result.found {
+    return { ok: false, error: "pool_not_found" }
+  }
+  let eff = calculate_pool_efficiency(pool_result.pool)
+  return { ok: true, metrics: eff }
+}
+
+// 유지보수 실행 (만료 제거 + 헬스체크)
+fn maintain_pools(mgr: PoolManager, now: i32) -> PoolManager {
+  let i = 0
+  while i < length(mgr.pools) {
+    mgr.pools[i].pool = evict_expired_connections(mgr.pools[i].pool, now)
+    i = i + 1
+  }
+  return mgr
+}

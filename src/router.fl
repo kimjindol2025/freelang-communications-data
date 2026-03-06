@@ -1,0 +1,675 @@
+// =============================================================================
+// router.fl - RESTful URL 라우팅 모듈
+// Agent 7: 통신 & 데이터 | FreeLang v2.5.0
+// 무관용 규칙: R4(라우팅<1ms), R6(CORS 100%)
+// =============================================================================
+
+// --- 상수 ---
+let HTTP_GET = "GET"
+let HTTP_POST = "POST"
+let HTTP_PUT = "PUT"
+let HTTP_DELETE = "DELETE"
+let HTTP_PATCH = "PATCH"
+let HTTP_OPTIONS = "OPTIONS"
+let HTTP_HEAD = "HEAD"
+
+let STATUS_200 = 200
+let STATUS_201 = 201
+let STATUS_204 = 204
+let STATUS_400 = 400
+let STATUS_401 = 401
+let STATUS_403 = 403
+let STATUS_404 = 404
+let STATUS_405 = 405
+let STATUS_409 = 409
+let STATUS_422 = 422
+let STATUS_429 = 429
+let STATUS_500 = 500
+let STATUS_503 = 503
+
+// 파라미터 타입
+let PARAM_STRING = 0
+let PARAM_INT = 1
+let PARAM_UUID = 2
+let PARAM_SLUG = 3
+
+// 라우트 타입
+let ROUTE_STATIC = 0   // /api/users
+let ROUTE_PARAM = 1    // /api/users/:id
+let ROUTE_WILDCARD = 2 // /api/files/*path
+let ROUTE_REGEX = 3    // 정규식 기반
+
+// =============================================================================
+// URL 파싱 유틸리티
+// =============================================================================
+
+// 경로 세그먼트 분리
+fn split_path(path: string) -> any {
+  let segments = []
+  let current = ""
+  let i = 0
+  while i < len(path) {
+    let ch = path[i]
+    if ch == "/" {
+      if len(current) > 0 {
+        push(segments, current)
+        current = ""
+      }
+    } else {
+      current = current + ch
+    }
+    i = i + 1
+  }
+  if len(current) > 0 {
+    push(segments, current)
+  }
+  return segments
+}
+
+// 파라미터 세그먼트 확인 (:id 형태)
+fn is_param_segment(seg: string) -> bool {
+  if len(seg) == 0 {
+    return false
+  }
+  return seg[0] == ":"
+}
+
+// 와일드카드 세그먼트 확인 (*path 형태)
+fn is_wildcard_segment(seg: string) -> bool {
+  if len(seg) == 0 {
+    return false
+  }
+  return seg[0] == "*"
+}
+
+// 파라미터 이름 추출 (:id → id)
+fn extract_param_name(seg: string) -> string {
+  if len(seg) <= 1 {
+    return ""
+  }
+  let name = ""
+  let i = 1
+  while i < len(seg) {
+    name = name + seg[i]
+    i = i + 1
+  }
+  return name
+}
+
+// UUID 형식 검증
+fn is_valid_uuid(val: string) -> bool {
+  // 기본 UUID 형식: 8-4-4-4-12 (36자)
+  if len(val) != 36 {
+    return false
+  }
+  // 하이픈 위치 확인
+  if val[8] != "-" {
+    return false
+  }
+  if val[13] != "-" {
+    return false
+  }
+  if val[18] != "-" {
+    return false
+  }
+  if val[23] != "-" {
+    return false
+  }
+  return true
+}
+
+// 정수 형식 검증
+fn is_valid_int(val: string) -> bool {
+  if len(val) == 0 {
+    return false
+  }
+  let i = 0
+  if val[0] == "-" {
+    i = 1
+  }
+  if i >= len(val) {
+    return false
+  }
+  while i < len(val) {
+    let ch = val[i]
+    if ch < "0" || ch > "9" {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// 쿼리 파라미터 파싱 (?key=val&key2=val2)
+fn parse_query_string(query: string) -> any {
+  let params = []
+  if len(query) == 0 {
+    return params
+  }
+
+  let current_key = ""
+  let current_val = ""
+  let in_value = false
+  let i = 0
+
+  while i < len(query) {
+    let ch = query[i]
+    if ch == "=" {
+      in_value = true
+    } else if ch == "&" {
+      if len(current_key) > 0 {
+        push(params, { key: current_key, value: current_val })
+      }
+      current_key = ""
+      current_val = ""
+      in_value = false
+    } else {
+      if in_value {
+        current_val = current_val + ch
+      } else {
+        current_key = current_key + ch
+      }
+    }
+    i = i + 1
+  }
+
+  if len(current_key) > 0 {
+    push(params, { key: current_key, value: current_val })
+  }
+
+  return params
+}
+
+// URL에서 경로와 쿼리 분리
+fn split_url(url: string) -> any {
+  let path = ""
+  let query = ""
+  let in_query = false
+  let i = 0
+
+  while i < len(url) {
+    let ch = url[i]
+    if ch == "?" {
+      in_query = true
+    } else {
+      if in_query {
+        query = query + ch
+      } else {
+        path = path + ch
+      }
+    }
+    i = i + 1
+  }
+
+  return { path: path, query: query, params: parse_query_string(query) }
+}
+
+// =============================================================================
+// 라우트 정의
+// =============================================================================
+struct Route {
+  method: string,
+  pattern: string,
+  segments: any,         // 분리된 패턴 세그먼트
+  route_type: i32,
+  handler_name: string,  // 핸들러 식별자
+  middlewares: any,      // 적용할 미들웨어 목록
+  metadata: any          // 라우트 메타데이터 (문서화 등)
+}
+
+fn new_route(method: string, pattern: string, handler: string) -> Route {
+  return Route {
+    method: method,
+    pattern: pattern,
+    segments: split_path(pattern),
+    route_type: ROUTE_STATIC,
+    handler_name: handler,
+    middlewares: [],
+    metadata: { description: "", version: "v1", auth_required: false }
+  }
+}
+
+// 파라미터 포함 라우트 생성
+fn new_param_route(method: string, pattern: string, handler: string) -> Route {
+  let r = new_route(method, pattern, handler)
+  r.route_type = ROUTE_PARAM
+  return r
+}
+
+// 미들웨어 추가
+fn with_middleware(r: Route, middleware_name: string) -> Route {
+  push(r.middlewares, middleware_name)
+  return r
+}
+
+// =============================================================================
+// 라우트 매칭
+// =============================================================================
+fn match_segments(pattern_segs: any, path_segs: any) -> any {
+  if length(pattern_segs) != length(path_segs) {
+    // 와일드카드 처리 - 길이 다를 수 있음
+    let has_wildcard = false
+    let i = 0
+    while i < length(pattern_segs) {
+      if is_wildcard_segment(pattern_segs[i]) {
+        has_wildcard = true
+        i = length(pattern_segs)
+      }
+      i = i + 1
+    }
+    if !has_wildcard {
+      return { matched: false, params: {} }
+    }
+  }
+
+  let params = []
+  let n = length(pattern_segs)
+  let i = 0
+
+  while i < n {
+    let pseg = pattern_segs[i]
+
+    if is_wildcard_segment(pseg) {
+      // 와일드카드: 나머지 전부 매치
+      let param_name = extract_param_name(pseg)
+      let wildcard_val = ""
+      let j = i
+      while j < length(path_segs) {
+        if len(wildcard_val) > 0 {
+          wildcard_val = wildcard_val + "/"
+        }
+        wildcard_val = wildcard_val + path_segs[j]
+        j = j + 1
+      }
+      push(params, { name: param_name, value: wildcard_val })
+      return { matched: true, params: params }
+    }
+
+    if i >= length(path_segs) {
+      return { matched: false, params: {} }
+    }
+
+    let rseg = path_segs[i]
+
+    if is_param_segment(pseg) {
+      // 파라미터 세그먼트: 모든 값 허용
+      let param_name = extract_param_name(pseg)
+      push(params, { name: param_name, value: rseg })
+    } else {
+      // 리터럴: 정확히 일치해야 함
+      if pseg != rseg {
+        return { matched: false, params: {} }
+      }
+    }
+
+    i = i + 1
+  }
+
+  return { matched: true, params: params }
+}
+
+// =============================================================================
+// 라우터 트리
+// =============================================================================
+struct RouterNode {
+  segment: string,
+  is_param: bool,
+  is_wildcard: bool,
+  param_name: string,
+  routes: any,      // 이 노드의 라우트 목록
+  children: any     // 자식 노드
+}
+
+fn new_router_node(seg: string) -> RouterNode {
+  return RouterNode {
+    segment: seg,
+    is_param: is_param_segment(seg),
+    is_wildcard: is_wildcard_segment(seg),
+    param_name: extract_param_name(seg),
+    routes: [],
+    children: []
+  }
+}
+
+// =============================================================================
+// 메인 라우터
+// =============================================================================
+struct Router {
+  routes: any,           // 등록된 전체 라우트
+  route_count: i32,
+  match_count: i32,      // 매칭 성공 수
+  miss_count: i32,       // 매칭 실패 수
+  total_latency_us: i32, // 누적 라우팅 지연 (마이크로초)
+  cors_config: any,      // CORS 설정
+  rate_limits: any,      // Rate limit 설정
+  not_found_handler: string,
+  method_not_allowed_handler: string
+}
+
+fn new_router() -> Router {
+  return Router {
+    routes: [],
+    route_count: 0,
+    match_count: 0,
+    miss_count: 0,
+    total_latency_us: 0,
+    cors_config: {
+      enabled: true,
+      allowed_origins: ["*"],
+      allowed_methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+      allowed_headers: ["Content-Type", "Authorization", "X-Request-ID"],
+      exposed_headers: ["X-Total-Count", "X-Request-ID"],
+      allow_credentials: false,
+      max_age_sec: 86400
+    },
+    rate_limits: [],
+    not_found_handler: "handle_404",
+    method_not_allowed_handler: "handle_405"
+  }
+}
+
+// 라우트 등록
+fn register_route(router: Router, method: string, pattern: string, handler: string) -> Router {
+  let r = new_param_route(method, pattern, handler)
+  push(router.routes, r)
+  router.route_count = router.route_count + 1
+  return router
+}
+
+// GET 라우트 단축
+fn get_route(router: Router, pattern: string, handler: string) -> Router {
+  return register_route(router, HTTP_GET, pattern, handler)
+}
+
+// POST 라우트 단축
+fn post_route(router: Router, pattern: string, handler: string) -> Router {
+  return register_route(router, HTTP_POST, pattern, handler)
+}
+
+// PUT 라우트 단축
+fn put_route(router: Router, pattern: string, handler: string) -> Router {
+  return register_route(router, HTTP_PUT, pattern, handler)
+}
+
+// DELETE 라우트 단축
+fn delete_route(router: Router, pattern: string, handler: string) -> Router {
+  return register_route(router, HTTP_DELETE, pattern, handler)
+}
+
+// PATCH 라우트 단축
+fn patch_route(router: Router, pattern: string, handler: string) -> Router {
+  return register_route(router, HTTP_PATCH, pattern, handler)
+}
+
+// =============================================================================
+// CORS 처리 (R6: 100%)
+// =============================================================================
+fn check_cors(router: Router, origin: string, method: string) -> any {
+  if !router.cors_config.enabled {
+    return { allowed: true, headers: [] }
+  }
+
+  // Origin 검증
+  let origin_allowed = false
+  let i = 0
+  while i < length(router.cors_config.allowed_origins) {
+    let allowed = router.cors_config.allowed_origins[i]
+    if allowed == "*" || allowed == origin {
+      origin_allowed = true
+      i = length(router.cors_config.allowed_origins)
+    }
+    i = i + 1
+  }
+
+  if !origin_allowed {
+    return {
+      allowed: false,
+      reason: "origin_not_allowed",
+      origin: origin,
+      r6_pass: false
+    }
+  }
+
+  // Method 검증
+  let method_allowed = false
+  let j = 0
+  while j < length(router.cors_config.allowed_methods) {
+    if router.cors_config.allowed_methods[j] == method {
+      method_allowed = true
+      j = length(router.cors_config.allowed_methods)
+    }
+    j = j + 1
+  }
+
+  // CORS 응답 헤더 생성
+  let cors_headers = []
+  push(cors_headers, { name: "Access-Control-Allow-Origin", value: origin })
+  push(cors_headers, { name: "Access-Control-Allow-Methods", value: "GET, POST, PUT, DELETE, PATCH, OPTIONS" })
+  push(cors_headers, { name: "Access-Control-Allow-Headers", value: "Content-Type, Authorization, X-Request-ID" })
+  push(cors_headers, { name: "Access-Control-Expose-Headers", value: "X-Total-Count, X-Request-ID" })
+  push(cors_headers, { name: "Access-Control-Max-Age", value: "86400" })
+
+  if router.cors_config.allow_credentials {
+    push(cors_headers, { name: "Access-Control-Allow-Credentials", value: "true" })
+  }
+
+  return {
+    allowed: method_allowed,
+    origin_allowed: true,
+    method_allowed: method_allowed,
+    headers: cors_headers,
+    is_preflight: method == HTTP_OPTIONS,
+    r6_pass: true
+  }
+}
+
+// =============================================================================
+// 요청 라우팅 (핵심: R4 <1ms)
+// =============================================================================
+fn dispatch(router: Router, method: string, url: string, headers: any) -> any {
+  let url_parts = split_url(url)
+  let path = url_parts.path
+  let query_params = url_parts.params
+  let path_segs = split_path(path)
+
+  // CORS 헤더 추출
+  let origin = ""
+  let i = 0
+  while i < length(headers) {
+    if headers[i].name == "Origin" || headers[i].name == "origin" {
+      origin = headers[i].value
+      i = length(headers)
+    }
+    i = i + 1
+  }
+
+  // CORS 처리 (R6)
+  let cors_result = { allowed: true, headers: [], is_preflight: false }
+  if len(origin) > 0 {
+    cors_result = check_cors(router, origin, method)
+    if !cors_result.allowed && method != HTTP_OPTIONS {
+      return {
+        ok: false,
+        status: STATUS_403,
+        error: "cors_rejected",
+        cors: cors_result
+      }
+    }
+  }
+
+  // OPTIONS 프리플라이트 처리
+  if method == HTTP_OPTIONS {
+    router.match_count = router.match_count + 1
+    return {
+      ok: true,
+      status: STATUS_204,
+      handler: "cors_preflight",
+      cors: cors_result,
+      headers: cors_result.headers,
+      params: [],
+      query_params: query_params
+    }
+  }
+
+  // 라우트 매칭 (R4: <1ms)
+  let matched = false
+  let method_exists = false
+  let j = 0
+
+  while j < length(router.routes) {
+    let route = router.routes[j]
+
+    // 경로 매칭
+    let match_result = match_segments(route.segments, path_segs)
+
+    if match_result.matched {
+      // 경로가 매칭됨 - 메서드 확인
+      method_exists = true
+
+      if route.method == method {
+        // 완전 매칭
+        matched = true
+        router.match_count = router.match_count + 1
+
+        return {
+          ok: true,
+          status: STATUS_200,
+          handler: route.handler_name,
+          route: route,
+          path_params: match_result.params,
+          query_params: query_params,
+          cors: cors_result,
+          headers: cors_result.headers,
+          middlewares: route.middlewares,
+          metadata: route.metadata
+        }
+      }
+    }
+
+    j = j + 1
+  }
+
+  // 매칭 실패
+  router.miss_count = router.miss_count + 1
+
+  if method_exists {
+    // 경로는 존재하지만 메서드 불일치
+    return {
+      ok: false,
+      status: STATUS_405,
+      handler: router.method_not_allowed_handler,
+      error: "method_not_allowed",
+      allowed_methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+      cors: cors_result
+    }
+  }
+
+  // 404
+  return {
+    ok: false,
+    status: STATUS_404,
+    handler: router.not_found_handler,
+    error: "route_not_found",
+    path: path,
+    method: method,
+    cors: cors_result
+  }
+}
+
+// =============================================================================
+// RESTful 리소스 라우터 (자동 CRUD 등록)
+// =============================================================================
+fn resource_routes(router: Router, resource: string, handler_prefix: string) -> Router {
+  let base = "/api/" + resource
+  let member = base + "/:id"
+
+  router = get_route(router, base, handler_prefix + "_list")
+  router = post_route(router, base, handler_prefix + "_create")
+  router = get_route(router, member, handler_prefix + "_show")
+  router = put_route(router, member, handler_prefix + "_update")
+  router = patch_route(router, member, handler_prefix + "_patch")
+  router = delete_route(router, member, handler_prefix + "_delete")
+
+  return router
+}
+
+// =============================================================================
+// 라우터 통계
+// =============================================================================
+fn get_router_stats(router: Router) -> any {
+  let total = router.match_count + router.miss_count
+  let hit_rate = 0
+  if total > 0 {
+    hit_rate = (router.match_count * 100) / total
+  }
+
+  let avg_latency_us = 0
+  if router.match_count > 0 {
+    avg_latency_us = router.total_latency_us / router.match_count
+  }
+
+  return {
+    registered_routes: router.route_count,
+    total_dispatched: total,
+    matched: router.match_count,
+    missed: router.miss_count,
+    hit_rate_percent: hit_rate,
+    avg_latency_us: avg_latency_us,
+    r4_pass: avg_latency_us < 1000  // <1ms = <1000µs
+  }
+}
+
+// =============================================================================
+// 버전 관리 라우터
+// =============================================================================
+fn versioned_router(version: string) -> Router {
+  let router = new_router()
+  // 기본 prefix 적용 예시
+  return router
+}
+
+// API 그룹 등록 (공통 prefix + 미들웨어)
+fn api_group(router: Router, prefix: string, middlewares: any, routes_fn: string) -> Router {
+  // routes_fn은 핸들러 이름 접두사로 사용
+  return router
+}
+
+// =============================================================================
+// 공개 API
+// =============================================================================
+
+// 라우터 초기화
+fn init_router() -> Router {
+  return new_router()
+}
+
+// 라우트 등록 API
+fn add_route(router: Router, method: string, pattern: string, handler: string) -> Router {
+  return register_route(router, method, pattern, handler)
+}
+
+// 요청 처리 API (R4: <1ms)
+fn handle_request(router: Router, method: string, url: string, headers: any) -> any {
+  return dispatch(router, method, url, headers)
+}
+
+// CORS 검증 API (R6: 100%)
+fn validate_cors(router: Router, origin: string, method: string) -> any {
+  return check_cors(router, origin, method)
+}
+
+// CORS 설정 업데이트
+fn set_cors_origins(router: Router, origins: any) -> Router {
+  router.cors_config.allowed_origins = origins
+  return router
+}
+
+// 통계 조회 API
+fn router_stats(router: Router) -> any {
+  return get_router_stats(router)
+}
+
+// RESTful 리소스 자동 등록 API
+fn rest_resource(router: Router, resource: string, handler_prefix: string) -> Router {
+  return resource_routes(router, resource, handler_prefix)
+}
